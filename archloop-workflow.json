@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Archloop Overnight Refactor Workflow",
+    "subtitle": "Evidence scan, isolated implementation, adversarial gate, and auditable reporting",
+    "output": "archloop-workflow.html",
+    "animation": "none",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "scan-to-plan",
+        "label": "Scan to plan",
+        "focus": ["preflight", "worktree", "baseline", "scan", "select", "plan"],
+        "note": "The script preflights the canonical checkout, creates isolation, then scans once and plans the strongest candidates."
+      },
+      {
+        "id": "implement-to-gate",
+        "label": "Implement to gate",
+        "focus": ["implement", "green", "gate", "verdict"],
+        "note": "Each planned item gets a fresh implementation session, green checks, and a separate reviewer session."
+      },
+      {
+        "id": "ship-or-park",
+        "label": "Ship or park",
+        "focus": ["gate", "verdict", "merge", "report", "select"],
+        "note": "SHIP enters merge and push; PARK resets the item to its base commit before the next candidate."
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "controller", "label": "Archloop driver" },
+    { "id": "canonical", "label": "Canonical repository" },
+    { "id": "isolation", "label": "Isolated worktree" },
+    { "id": "audit", "label": "Artifacts + reporting" },
+    { "id": "sessions", "label": "Model sessions" },
+    { "id": "quality", "label": "Checks + gate" }
+  ],
+  "phases": [
+    { "id": "prepare", "label": "Prepare safely", "fromCol": 0, "toCol": 1, "variant": "security" },
+    { "id": "discover", "label": "Discover", "fromCol": 2, "toCol": 2, "variant": "emphasis" },
+    { "id": "change", "label": "Change one item", "fromCol": 3, "toCol": 4, "variant": "emphasis" },
+    { "id": "publish", "label": "Publish evidence", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [],
+  "mainPath": ["preflight", "worktree", "baseline", "scan", "select", "plan", "implement", "green", "gate", "verdict", "merge", "report"],
+  "nodes": [
+    { "id": "preflight", "lane": "controller", "col": 0, "type": "security", "label": "Preflight", "sublabel": "clean main + tests" },
+    { "id": "worktree", "lane": "isolation", "col": 1, "type": "cloud", "label": "Worktree", "sublabel": "cache", "tag": "safe", "width": 50 },
+    { "id": "baseline", "lane": "isolation", "col": 2, "type": "backend", "label": "Baseline", "sublabel": "test + lint", "width": 50 },
+    { "id": "scan", "lane": "sessions", "col": 2, "type": "backend", "label": "Scan", "sublabel": "one fresh session", "tag": "candidate pool" },
+    { "id": "select", "lane": "sessions", "col": 3, "type": "backend", "label": "Select", "sublabel": "Strong, best first", "tag": "max items" },
+    { "id": "plan", "lane": "audit", "col": 3, "type": "backend", "label": "Plan", "sublabel": "self-contained" },
+    { "id": "implement", "lane": "isolation", "col": 4, "type": "backend", "label": "Implement", "sublabel": "exact scope + commit", "tag": "fresh session" },
+    { "id": "green", "lane": "quality", "col": 4, "type": "security", "label": "Checks", "sublabel": "tests + lint, 3x", "tag": "blocking" },
+    { "id": "gate", "lane": "quality", "col": 5, "type": "security", "label": "Gate", "sublabel": "diff vs plan", "tag": "fix authority" },
+    { "id": "verdict", "lane": "controller", "col": 5, "type": "security", "label": "Verdict", "sublabel": "SHIP or PARK", "tag": "verdict file" },
+    { "id": "merge", "lane": "canonical", "col": 5, "type": "cloud", "label": "Merge", "sublabel": "shipped commits", "tag": "no force-push" },
+    { "id": "report", "lane": "audit", "col": 5, "type": "external", "label": "Report", "sublabel": "REPORT + ledger", "tag": "auditable" }
+  ],
+  "edges": [
+    { "from": "preflight", "to": "worktree" },
+    { "from": "worktree", "to": "baseline" },
+    { "from": "baseline", "to": "scan" },
+    { "from": "scan", "to": "select" },
+    { "from": "select", "to": "plan" },
+    { "from": "plan", "to": "implement" },
+    { "from": "implement", "to": "green" },
+    { "from": "green", "to": "gate" },
+    { "from": "gate", "to": "verdict", "route": "outside-right", "fromSide": "right", "toSide": "right" },
+    { "from": "verdict", "to": "merge", "variant": "emphasis", "role": "main", "route": "drop", "fromSide": "bottom", "toSide": "top" },
+    { "from": "merge", "to": "report" },
+    { "from": "verdict", "to": "select", "variant": "security", "role": "error", "route": "return-left", "fromSide": "left", "toSide": "left" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Safety boundaries", "items": ["Abort on a dirty canonical checkout or red baseline", "All sessions and tests run inside the linked worktree", "Park resets a failed item to its base commit"] },
+    { "dot": "violet", "title": "Fresh context", "items": ["Scan and plan happen once per run", "Implementation and gate are separate sessions", "The gate reviews the actual diff against the item plan"] },
+    { "dot": "cyan", "title": "Durable evidence", "items": ["Stage logs and verdict files live under .archloop/night-date", "Shipped commits are merged and optionally pushed", "REPORT.md and ledger.md preserve the run outcome"] }
+  ]
+}
