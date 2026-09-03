@@ -92,15 +92,15 @@ DEFAULT_MAX_ITEMS=5
 DEFAULT_SESSION_TIMEOUT=7200
 DEFAULT_GATE_TIMEOUT=7200
 DEFAULT_IDLE_TIMEOUT=600
-# Routing (2026-08-26, Andre): all three roles use one model,
-# zai/glm-5.3-flash — verified live-routable opencode id:
-# openrouter/z-ai/glm-5.3-flash.
-# Per-role override via ARCHLOOP_MODEL_* env or <repo>/.archloop/config.
+# Routing (2026-09-01, Andre): z.ai GLM plan — the fleet is GLM-only via the
+# plan; openrouter ids charge PAYG. scan/impl = flash, gate = the plan's big
+# model. Per-role override via ARCHLOOP_MODEL_* env or <repo>/.archloop/config.
 # Models are defined here only; do not duplicate them elsewhere.
-DEFAULT_MODEL_SCAN="openrouter/z-ai/glm-5.3-flash"
+DEFAULT_MODEL_SCAN="zai/glm-5.3-flash"
 # Cheapest model: implementing a good plan is transcription.
-DEFAULT_MODEL_IMPL="openrouter/z-ai/glm-5.3-flash"
-DEFAULT_MODEL_GATE="openrouter/z-ai/glm-5.3-flash"
+DEFAULT_MODEL_IMPL="zai/glm-5.3-flash"
+# Strongest reviewer stays on the plan's big model.
+DEFAULT_MODEL_GATE="zai/glm-5.3"
 DEFAULT_WORKTREE_BASE="$HOME/.cache/archloop"
 DEFAULT_BASE_BRANCH="main"
 

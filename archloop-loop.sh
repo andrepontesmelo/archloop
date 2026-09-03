@@ -45,6 +45,15 @@ MAX_ROUNDS="${3:-${ARCHLOOP_MAX_LOOPS:-8}}"
 NIGHT="$(date +%F)"
 WORK="$REPO/.archloop/night-$NIGHT"
 LOGFILE="$REPO/.archloop/loop-driver.log"
+# First run on a repo without a pre-existing .archloop/ must not crash the
+# first log write (DEF-1): create the dir before tee/redirect touch it, and
+# exclude it from git status BEFORE run.sh's dirty-tree preflight (run.sh adds
+# the exclude itself only after its preflight, so a fresh .archloop/ would
+# otherwise abort every first run as "dirty tree"). Same repo-local ignore
+# mechanism run.sh uses; idempotent via the grep guard.
+mkdir -p "$(dirname "$LOGFILE")"
+grep -qx '.archloop/' "$REPO/.git/info/exclude" 2>/dev/null \
+  || printf '.archloop/\n' >> "$REPO/.git/info/exclude"
 
 log() { printf '%s %s\n' "$(date +%T)" "$*" | tee -a "$LOGFILE"; }
 
