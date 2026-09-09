@@ -1,5 +1,11 @@
 # archloop
 
+[![CI](https://github.com/andrepontesmelo/archloop/actions/workflows/ci.yml/badge.svg)](https://github.com/andrepontesmelo/archloop/actions/workflows/ci.yml)
+![Version](https://img.shields.io/badge/version-2026.09-blue)
+![local gate](https://img.shields.io/badge/local%20gate-25%20assertions-brightgreen)
+
+![archloop banner](docs/images/banner.png)
+
 Unattended overnight architecture-improvement loop for a git repository. A deterministic
 bash state machine automates [Matt Pocock's](https://www.mattpocock.dev) improve-architecture
 skill: it runs the skill, triggers an `opencode` session to implement each Strong
@@ -42,12 +48,53 @@ sessions that could apply them never start. archloop makes the loop unattended: 
 implement, review, repeat — every night if you want, with every change gated by a
 fresh-context review before it can merge.
 
+## Screenshots
+
+![Run pipeline — scan to merge in one round](docs/images/run-pipeline.png)
+
+> PLACEHOLDER screenshot — mock drafted from documented example values; swap for a real capture at review.
+
+![Scan output — Strong candidates and the PLANNED verdict](docs/images/scan-strong.png)
+
+> PLACEHOLDER screenshot — mock drafted from documented example values; swap for a real capture at review.
+
 ## Install
 
-No package, no dependencies — clone and run:
+Clone and run — no package, no dependencies beyond bash, git, and an
+`opencode` binary on PATH with a configured model:
 
 ```bash
-git clone https://github.com/andrepontesmelo/andre-archloop
+git clone https://github.com/andrepontesmelo/archloop
+cd archloop
+```
+
+There is no tarball release, so there is no checksum to verify — pin a tag
+or commit for reproducibility instead of floating on a branch:
+
+```bash
+git checkout <tag-or-commit>   # pin what you run, especially overnight
+```
+
+> [!WARNING]
+> The loop drives sessions that implement code and run reviews in worktrees:
+> it never touches the canonical tree, but it executes agent-written code.
+> Review the target repo's `.archloop/config` before unattended overnight
+> runs — a wrong test/lint command or model id burns quota or merges surprises.
+> Model credentials are required in the session runner's config.
+
+Verify the install with the zero-quota gate (no model calls, no keys needed):
+
+```bash
+bash scripts/stub-validation.sh   # 25 assertions across 6 scenarios
+```
+
+Useful commands:
+
+```bash
+bash scripts/stub-validation.sh   # the local gate — run before every push
+bash scripts/concurrency-proof.sh # local-only parallel double-run evidence (not a CI step)
+./run.sh /path/to/repo [max_items]
+./archloop-loop.sh /path/to/repo [max_items] [max_rounds]
 ```
 
 ## Quick start
@@ -64,6 +111,18 @@ Optional per-repo config is read from the target's `.archloop/config` (model ove
 merge/push toggles, night label). Artifacts land in the target's `.archloop/` — add
 `.archloop/` to the repo's `.git/info/exclude` (the loop driver does this itself if it's
 missing).
+
+## Docs
+
+Start at the [docs index](docs/index.md):
+
+- [Architecture](docs/architecture.md) — pipeline, pieces, verdict contract, sequence.
+- [Development](docs/development.md) — layout, the local gate, conventions, pre-push checklist.
+
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and the local gate.
+Security issues: [SECURITY.md](SECURITY.md) (do not open a public issue).
 
 ## Roadmap
 
