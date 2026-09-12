@@ -13,10 +13,11 @@ Thanks for looking at archloop. PRs welcome.
    bash scripts/stub-validation.sh
    ```
 
-   For harness-path changes, also run the local-only concurrency evidence:
+   For harness-path changes, also run the concurrency gate (same one CI
+   runs):
 
    ```bash
-   bash scripts/concurrency-proof.sh
+   bash scripts/concurrency-gate.sh
    ```
 
 4. Open a PR describing what changed and why.

@@ -48,15 +48,35 @@ sessions that could apply them never start. archloop makes the loop unattended: 
 implement, review, repeat — every night if you want, with every change gated by a
 fresh-context review before it can merge.
 
-## Screenshots
+## How it flows
 
-![Run pipeline — scan to merge in one round](docs/images/run-pipeline.png)
+One `run.sh` round — the script sequences, models think inside stages:
 
-> PLACEHOLDER screenshot — mock drafted from documented example values; swap for a real capture at review.
+```mermaid
+flowchart TD
+    P["Preflight — clean tree · on main · baseline green"] -->|"abort"| X["ABORT — canonical tree untouched"]
+    P --> S["Scan — list Strong candidates, plan best first"]
+    S -->|"NONE verdict"| D["Stop — nothing Strong left"]
+    S -->|"PLANNED"| I["Implement — isolated worktree, tests + lint green"]
+    I --> G["Gate — fresh-context review per item"]
+    G -->|"SHIP"| N{"more items?"}
+    G -->|"PARK — branch reset, costs one item"| N
+    N -->|"yes"| I
+    N -->|"no"| M["Merge SHIPped --no-ff · push"]
+    M --> R["REPORT.md + ledger in target .archloop/"]
+```
 
-![Scan output — Strong candidates and the PLANNED verdict](docs/images/scan-strong.png)
+What makes a find Strong — and where each one ends up:
 
-> PLACEHOLDER screenshot — mock drafted from documented example values; swap for a real capture at review.
+```mermaid
+flowchart LR
+    A["Architecture scan"] --> B{"Strong candidate?"}
+    B -->|"duplication or split contract across 3+ sites, or a silent failure mode — and the fix removes more code than it adds"| C["Planned, best first"]
+    B -->|"everything else"| W["Weak — never planned"]
+    C --> E["Fresh-context review in a worktree"]
+    E -->|"SHIP"| F["Merged --no-ff to main"]
+    E -->|"PARK"| L["PARKED in the ledger, branch reset"]
+```
 
 ## Install
 
@@ -92,7 +112,7 @@ Useful commands:
 
 ```bash
 bash scripts/stub-validation.sh   # the local gate — run before every push
-bash scripts/concurrency-proof.sh # local-only parallel double-run evidence (not a CI step)
+bash scripts/concurrency-gate.sh  # the CI concurrency gate: two parallel suite runs
 ./run.sh /path/to/repo [max_items]
 ./archloop-loop.sh /path/to/repo [max_items] [max_rounds]
 ```
@@ -105,7 +125,14 @@ bash scripts/concurrency-proof.sh # local-only parallel double-run evidence (not
 
 # loop until no Strong candidates remain (or MAX_ROUNDS hit)
 ./archloop-loop.sh /path/to/repo [max_items] [max_rounds]
+
+# nightly: install once — 02:17 every night, unattended
+( crontab -l 2>/dev/null; echo "17 2 * * * /path/to/archloop/archloop-loop.sh /path/to/target-repo" ) | crontab -
 ```
+
+Scheduled runs are fully self-logging: the loop driver writes every round and
+verdict into the target's `.archloop/loop-driver.log`. A systemd user timer
+alternative and unattended-run notes live in [docs/nightly.md](docs/nightly.md).
 
 Optional per-repo config is read from the target's `.archloop/config` (model overrides,
 merge/push toggles, night label). Artifacts land in the target's `.archloop/` — add
@@ -117,6 +144,7 @@ missing).
 Start at the [docs index](docs/index.md):
 
 - [Architecture](docs/architecture.md) — pipeline, pieces, verdict contract, sequence.
+- [Nightly runs](docs/nightly.md) — cron / systemd user timer install, unattended-run notes.
 - [Development](docs/development.md) — layout, the local gate, conventions, pre-push checklist.
 
 ## Contributing

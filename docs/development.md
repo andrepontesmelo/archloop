@@ -6,7 +6,7 @@
 run.sh                     single-round driver (preflight → scan → implement → gate → merge → push)
 archloop-loop.sh           loop-until-NONE driver (re-runs run.sh, MAX_ROUNDS cap, default 8)
 scripts/stub-validation.sh the local gate — zero-quota stub harness (THE gate, also what CI runs)
-scripts/concurrency-proof.sh local-only evidence: two parallel gate runs (NOT a CI step)
+scripts/concurrency-gate.sh  CI concurrency gate: two parallel suite runs, both must finish green
 archloop-workflow.json     source data for the workflow diagram
 archloop-workflow.html     generated diagram (do not edit by hand)
 docs/                      index.md (start-here) · architecture.md · development.md (this file)
@@ -26,13 +26,15 @@ wrong-branch abort, gate-park (no merge, ledger records PARK), stale-worktree
 prune, and first-run-on-fresh-repo via `archloop-loop.sh`. Concurrency-safe
 via per-run `mktemp -d` dirs — parallel runs never collide on shared paths.
 
-CI (`.github/workflows/ci.yml`) runs exactly this gate: checkout, then
-`bash scripts/stub-validation.sh` — no setup steps, no test-framework install,
-nothing else. CI must equal the local gate; drift is a defect.
+CI (`.github/workflows/ci.yml`) runs exactly this gate plus the concurrency
+gate: checkout, then `bash scripts/stub-validation.sh`, then
+`bash scripts/concurrency-gate.sh` — no setup steps, no test-framework
+install, nothing else. CI must equal the local gate; drift is a defect.
 
-`scripts/concurrency-proof.sh` is deliberately NOT a CI step: it double-runs
-the whole suite in parallel (slow, timing-sensitive under Actions) — it is
-local-only evidence. Run it before releases that touch the harness paths.
+`scripts/concurrency-gate.sh` double-runs the whole suite in parallel and
+gates on end state only — both runs exit green, no wall-clock assertions — so
+it is deterministic and timing-insensitive under Actions. Run it before
+releases that touch the harness paths; CI runs it on every push.
 
 ## Conventions
 

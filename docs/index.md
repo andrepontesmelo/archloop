@@ -8,7 +8,9 @@ and gates every change with a fresh-context review before merge.
 
 1. [README](../README.md) — what it does, install, quick start.
 2. [Architecture](architecture.md) — pipeline, pieces, verdict contract, sequence.
-3. [Development](development.md) — layout, the local gate
+3. [Nightly runs](nightly.md) — cron / systemd user timer install for
+   unattended scheduled runs.
+4. [Development](development.md) — layout, the local gate
    (`bash scripts/stub-validation.sh`), conventions, pre-push checklist.
 
 ## Reference in this repo
@@ -19,9 +21,9 @@ and gates every change with a fresh-context review before merge.
   `run.sh` until the scan verdict is `NONE` or `MAX_ROUNDS` is hit.
 - [scripts/stub-validation.sh](../scripts/stub-validation.sh) — the local gate:
   zero-quota stub harness, 25 assertions across 6 scenarios.
-- [scripts/concurrency-proof.sh](../scripts/concurrency-proof.sh) — local-only
-  evidence that two parallel gate runs do not interfere (too slow for CI,
-  not a CI step).
+- [scripts/concurrency-gate.sh](../scripts/concurrency-gate.sh) — the CI
+  concurrency gate: two parallel suite runs must both finish green; judged on
+  end state only, so it is deterministic (also runs in CI on every push).
 - [archloop-workflow.json](../archloop-workflow.json) — source data for the
   workflow diagram ([archloop-workflow.html](../archloop-workflow.html),
   generated, do not edit by hand).
