@@ -4,7 +4,7 @@
 
 ## What it does
 
-Unattended overnight loop that eats architecture debt in a git repository. It automates [Matt Pocock's](https://www.mattpocock.dev) improve-codebase-architecture skill — Pocock is a well-known TypeScript educator, and his skill scans a codebase for **deepening opportunities**: refactors that turn shallow modules (interface nearly as complex as the implementation) into deep ones, where a small interface hides a lot of behaviour. archloop keeps applying what that scan finds until it reports nothing strong left.
+Unattended overnight loop that eats architecture debt in a git repository. It automates [Matt Pocock's](https://www.mattpocock.dev) improve-codebase-architecture skill. Pocock teaches AI-assisted engineering (AI Hero) and that skill scans a codebase for **deepening opportunities**: refactors that turn shallow modules (interface nearly as complex as the implementation) into deep ones, where a small interface hides a lot of behaviour. archloop keeps applying what that scan finds until it reports nothing strong left.
 
 What that looks like over a few nights:
 
