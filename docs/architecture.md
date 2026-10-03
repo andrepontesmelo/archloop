@@ -53,10 +53,9 @@ is the design-decision log; this file maps the moving parts.
   kills orphans of this repo only; `.archloop/` is created and git-excluded
   before the first log write so first runs on fresh repos do not abort.
 - **Model sessions — one `opencode run` per stage boundary.** Routing is
-  independent per stage: scan decides whether the run is worth anything and
-  is unrecoverable downstream, so it gets the strongest model, once; the
-  gate is the only reviewer left, so it gets the same strong model;
-  implementation is transcription of a good plan, so it keeps the cheapest.
+  independent per stage: scan and implementation run on the cheap flash
+  model — implementing a good plan is transcription; the gate is the only
+  reviewer left, so it alone runs on the plan's big model.
   Scan→pick→plan share ONE session (same mental model, no self-review);
   the gate NEVER shares a session with what it reviews — fresh context is
   the mechanism that makes the loop worth running.

@@ -9,7 +9,7 @@ scripts/stub-validation.sh the local gate — zero-quota stub harness (THE gate,
 scripts/concurrency-gate.sh  CI concurrency gate: two parallel suite runs, both must finish green
 archloop-workflow.json     source data for the workflow diagram
 archloop-workflow.html     generated diagram (do not edit by hand)
-docs/                      index.md (start-here) · architecture.md · development.md (this file)
+docs/                      index.md (start-here) · architecture.md · development.md (this file) · nightly.md
 ```
 
 ## The local gate
