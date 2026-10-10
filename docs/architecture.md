@@ -35,16 +35,26 @@ is the design-decision log; this file maps the moving parts.
 ## Pieces
 
 - **`run.sh` — the single-round driver.** Owns preflight (clean tree, on
-  `main`, baseline green, stale-worktree prune), worktree creation, every
-  stage invocation, the `green` retry helper, `park`, merge `--no-ff` and
-  push. Knobs via env or `<repo>/.archloop/config` (config wins over env):
+  `main`, baseline green, stale-worktree prune), the provider preflight ping
+  (one cheap call to the resolved scan model before the first session; on
+  failure back off and retry once, then abort with the reason instead of
+  burning the night on a 429/401/402), worktree creation, every stage
+  invocation (a provider-class session failure — rate limit, 401, 402, or a
+  silent non-zero death — is retried once after a backoff, on
+  `ARCHLOOP_MODEL_FALLBACK` when set; every other failure class aborts or
+  parks exactly as before), the `green` retry helper, `park`, merge `--no-ff`
+  and push. Knobs via env or `<repo>/.archloop/config` (for
+  ARCHLOOP_MODEL_SCAN / _IMPL / _GATE / _FALLBACK, launch-time env beats the
+  config, which beats the built-in defaults):
   `ARCHLOOP_TEST_CMD` / `ARCHLOOP_LINT_CMD` (required),
   `ARCHLOOP_MAX_ITEMS` (default 5), `ARCHLOOP_WORKTREE_BASE`,
   `ARCHLOOP_BASE_BRANCH` (default `main`), `ARCHLOOP_MERGE` /
   `ARCHLOOP_PUSH` (default 1), per-role models `ARCHLOOP_MODEL_SCAN` /
-  `_IMPL` / `_GATE`, timeouts `ARCHLOOP_SESSION_TIMEOUT` / `GATE_TIMEOUT` /
-  `IDLE_TIMEOUT`. Model defaults live in `run.sh` only — never duplicate
-  them elsewhere.
+  `_IMPL` / `_GATE` (+ optional `ARCHLOOP_MODEL_FALLBACK`), timeouts
+  `ARCHLOOP_SESSION_TIMEOUT` / `GATE_TIMEOUT` / `IDLE_TIMEOUT` /
+  `RETRY_BACKOFF` (default 120s; shrink only to exercise the retry paths in a
+  dry run). Model defaults live in `scripts/lib/lanes.sh` only (sourced by
+  run.sh, bin/archloop, and the ui) — never duplicate them elsewhere.
 - **`archloop-loop.sh` — loop-until-NONE driver.** Re-runs `run.sh` until the
   `verdict` file still says `NONE` after a round (a shipped round overwrites
   it with the last gate's SHIP/PARK, so a surviving NONE unambiguously means
@@ -53,9 +63,10 @@ is the design-decision log; this file maps the moving parts.
   kills orphans of this repo only; `.archloop/` is created and git-excluded
   before the first log write so first runs on fresh repos do not abort.
 - **Model sessions — one `opencode run` per stage boundary.** Routing is
-  independent per stage: scan and implementation run on the cheap flash
-  model — implementing a good plan is transcription; the gate is the only
-  reviewer left, so it alone runs on the plan's big model.
+  independent per stage: scan decides whether the run is worth anything and
+  is unrecoverable downstream, so it gets the strongest model, once; the
+  gate is the only reviewer left, so it gets the same strong model;
+  implementation is transcription of a good plan, so it keeps the cheapest.
   Scan→pick→plan share ONE session (same mental model, no self-review);
   the gate NEVER shares a session with what it reviews — fresh context is
   the mechanism that makes the loop worth running.

@@ -6,6 +6,11 @@
 # Env: HOME must be the REAL user home (Hermes sandboxes it) — overridden via
 #      getent fallback, same as run.sh does for opencode.
 #
+# v4 (2026-09-23, card E): status.json emitter. The loop owns pid/trigger/
+#   round/max_rounds and writes them (atomic tmp+rename) at every round
+#   start; run.sh refines "stage" at its transitions. `archloop status`
+#   prefers this file over v1 artifact parsing, closing the alive (MEDIUM)
+#   and trigger (LOW) gaps from r1-status-sources (gaps 1/2/5).
 # v3 (2026-08-03): consolidated into the repo as the single loop driver.
 #   - NONE detection reads the structured verdict file ($WORK/verdict == NONE)
 #     instead of grepping REPORT.md prose ("No Strong candidates"). The runner
@@ -45,6 +50,8 @@ MAX_ROUNDS="${3:-${ARCHLOOP_MAX_LOOPS:-8}}"
 NIGHT="$(date +%F)"
 WORK="$REPO/.archloop/night-$NIGHT"
 LOGFILE="$REPO/.archloop/loop-driver.log"
+STATUS_JSON="$REPO/.archloop/status.json"
+NIGHT_LOG="${ARCHLOOP_NIGHT_LOG:-$HOME/.hermes/logs/archloop-night.log}"
 # First run on a repo without a pre-existing .archloop/ must not crash the
 # first log write (DEF-1): create the dir before tee/redirect touch it, and
 # exclude it from git status BEFORE run.sh's dirty-tree preflight (run.sh adds
@@ -57,9 +64,44 @@ grep -qx '.archloop/' "$REPO/.git/info/exclude" 2>/dev/null \
 
 log() { printf '%s %s\n' "$(date +%T)" "$*" | tee -a "$LOGFILE"; }
 
+# --- card E: .archloop/status.json -------------------------------------------
+# The loop owns pid/trigger/round/max_rounds; run.sh refines "stage" at its
+# session transitions (same tmp+rename write). `archloop status` prefers this
+# file over v1 artifact parsing (closes r1 gaps 1/2/5: no pid artifact, no
+# trigger record, round only in log prose).
+detect_trigger() {
+  # A launcher that knows (bin/archloop start exports manual) says so;
+  # anything else falls through to nightly self-detection.
+  case "${ARCHLOOP_TRIGGER:-}" in
+    nightly|manual) printf '%s\n' "$ARCHLOOP_TRIGGER"; return 0 ;;
+  esac
+  # The nightly cron writes a full-datetime "START <name>:" line to the night
+  # log seconds before launching this loop. Only a START within the last 10
+  # minutes counts: a same-day line from an earlier nightly must not claim a
+  # later manual run (v1's whole-day window misread exactly that).
+  local line start
+  line="$(grep -F "START $(basename "$REPO"):" "$NIGHT_LOG" 2>/dev/null | tail -1 || true)"
+  start="$(cut -d' ' -f1-2 <<<"$line" | date -f - +%s 2>/dev/null || true)"
+  if [ -n "$start" ] && [ "$start" -le "$(date +%s)" ] \
+     && [ $(( $(date +%s) - start )) -le 600 ]; then
+    echo nightly
+  else
+    echo manual
+  fi
+}
+
+TRIGGER="$(detect_trigger)"
+write_status() { # $1=round $2=stage — atomic tmp+rename; readers never see a partial file
+  local tmp="$STATUS_JSON.tmp.$$"
+  printf '{\n  "pid": %s,\n  "trigger": "%s",\n  "round": %s,\n  "max_rounds": %s,\n  "stage": "%s",\n  "updated_at": %s\n}\n' \
+    "$$" "$TRIGGER" "$1" "$MAX_ROUNDS" "$2" "$(date +%s)" > "$tmp" \
+    && mv -f "$tmp" "$STATUS_JSON"
+}
+
 log "archloop loop driver v3 start — repo=$REPO max_items=$MAX_ITEMS max_rounds=$MAX_ROUNDS runner=$RUNNER"
 for i in $(seq 1 "$MAX_ROUNDS"); do
   log "=== round $i/$MAX_ROUNDS: starting run.sh ==="
+  write_status "$i" "idle"
 
   # Kill orphaned run.sh from a PREVIOUS attempt of THIS repo only. Exact repo
   # path in the pattern — never matches a foreign loop on another repo.

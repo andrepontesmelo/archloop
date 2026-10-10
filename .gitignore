@@ -1,3 +1,5 @@
 # gitignore
 .worktrees/
 .archloop/
+# exception: the ui fixture corpus ships synthetic .archloop trees (tests/ui-fixtures)
+!tests/ui-fixtures/**

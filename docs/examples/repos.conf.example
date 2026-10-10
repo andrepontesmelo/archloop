@@ -1,0 +1,5 @@
+# archloop UI repos — one checkout path per line
+# Absolute paths only; each path must contain a .archloop/ dir.
+# Duplicates collapse; display name = basename of the path.
+/home/you/git/project-a
+/home/you/git/project-b

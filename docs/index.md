@@ -20,7 +20,7 @@ and gates every change with a fresh-context review before merge.
 - [archloop-loop.sh](../archloop-loop.sh) — loop-until-NONE driver; re-runs
   `run.sh` until the scan verdict is `NONE` or `MAX_ROUNDS` is hit.
 - [scripts/stub-validation.sh](../scripts/stub-validation.sh) — the local gate:
-  zero-quota stub harness, 25 assertions across 6 scenarios.
+  zero-quota stub harness, 156 assertions across 16 scenarios.
 - [scripts/concurrency-gate.sh](../scripts/concurrency-gate.sh) — the CI
   concurrency gate: two parallel suite runs must both finish green; judged on
   end state only, so it is deterministic (also runs in CI on every push).

@@ -92,27 +92,55 @@ DEFAULT_MAX_ITEMS=5
 DEFAULT_SESSION_TIMEOUT=7200
 DEFAULT_GATE_TIMEOUT=7200
 DEFAULT_IDLE_TIMEOUT=600
-# Routing (2026-09-01, Andre): z.ai GLM plan — the fleet is GLM-only via the
-# plan; openrouter ids charge PAYG. scan/impl = flash, gate = the plan's big
-# model. Per-role override via ARCHLOOP_MODEL_* env or <repo>/.archloop/config.
-# Models are defined here only; do not duplicate them elsewhere.
-DEFAULT_MODEL_SCAN="zai/glm-5.3-flash"
-# Cheapest model: implementing a good plan is transcription.
-DEFAULT_MODEL_IMPL="zai/glm-5.3-flash"
-# Strongest reviewer stays on the plan's big model.
-DEFAULT_MODEL_GATE="zai/glm-5.3"
+# Backoff before a provider retry (preflight ping and provider-class session
+# retry). Overridable so a dry run can exercise the retry paths without
+# sleeping 120s; production nights keep 120.
+DEFAULT_RETRY_BACKOFF=120
+# Routing (2026-10-04, kanban t_fff272bd): all three roles ride the big lane.
+# The zai lane is routable again, verified live with a PONG probe. The
+# 2026-09-28 defaults (kanban t_62f0ecc9) sat on opencode FREE lanes only
+# because zai was disabled then; those days are over. openrouter ids charge
+# PAYG — never a default.
+# Per-role override via ARCHLOOP_MODEL_* env (beats config) or
+# <repo>/.archloop/config (beats these defaults).
+# The lane ids themselves are defined once, in scripts/lib/lanes.sh — every
+# consumer (run.sh roles, bin/archloop presets, ui summary default) derives
+# from that file; never duplicate them elsewhere.
+# Provider-class retry lane for session(): MUST stay on a different provider
+# than the primaries, so it can actually hop when zai is down. Free
+# tier, not PAYG.
 DEFAULT_WORKTREE_BASE="$HOME/.cache/archloop"
 DEFAULT_BASE_BRANCH="main"
 
 REPO="${1:?usage: run.sh /path/to/repo [max_items]}"
 REPO="$(realpath "$REPO")"
 
-# --- knobs (env, or sourced <repo>/.archloop/config) ------------------------
+LANES="$(cd "$(dirname "$(realpath "$0")")/scripts/lib" && pwd)/lanes.sh"
+. "$LANES"
+
+# --- knobs: launch env > <repo>/.archloop/config > DEFAULT_* -----------------
+# Stash launch-time model env BEFORE sourcing the config: trigger-time
+# ARCHLOOP_MODEL_* (harness `archloop start`, spec card A) must beat the repo
+# config, while the config still beats the built-in DEFAULT_* below. The
+# nightly cron sets no model env, so its resolution (config > default) is
+# unchanged.
+_LAUNCH_MODEL_SCAN="${ARCHLOOP_MODEL_SCAN:-}"
+_LAUNCH_MODEL_IMPL="${ARCHLOOP_MODEL_IMPL:-}"
+_LAUNCH_MODEL_GATE="${ARCHLOOP_MODEL_GATE:-}"
+# Optional failover model: a provider-class session retry (429/401/402, silent
+# death) re-runs ONCE on this id. Same precedence chain as the role models:
+# launch env > <repo>/.archloop/config > LANE_FALLBACK (scripts/lib/lanes.sh).
+_LAUNCH_MODEL_FALLBACK="${ARCHLOOP_MODEL_FALLBACK:-}"
 [ -f "$REPO/.archloop/config" ] && . "$REPO/.archloop/config"
+ARCHLOOP_MODEL_SCAN="${_LAUNCH_MODEL_SCAN:-${ARCHLOOP_MODEL_SCAN:-}}"
+ARCHLOOP_MODEL_IMPL="${_LAUNCH_MODEL_IMPL:-${ARCHLOOP_MODEL_IMPL:-}}"
+ARCHLOOP_MODEL_GATE="${_LAUNCH_MODEL_GATE:-${ARCHLOOP_MODEL_GATE:-}}"
+ARCHLOOP_MODEL_FALLBACK="${_LAUNCH_MODEL_FALLBACK:-${ARCHLOOP_MODEL_FALLBACK:-$LANE_FALLBACK}}"
+unset -v _LAUNCH_MODEL_SCAN _LAUNCH_MODEL_IMPL _LAUNCH_MODEL_GATE _LAUNCH_MODEL_FALLBACK
 MAX_ITEMS="${2:-${ARCHLOOP_MAX_ITEMS:-$DEFAULT_MAX_ITEMS}}"
-M_SCAN="${ARCHLOOP_MODEL_SCAN:-$DEFAULT_MODEL_SCAN}"
-M_IMPL="${ARCHLOOP_MODEL_IMPL:-$DEFAULT_MODEL_IMPL}"
-M_GATE="${ARCHLOOP_MODEL_GATE:-$DEFAULT_MODEL_GATE}"
+M_SCAN="${ARCHLOOP_MODEL_SCAN:-$LANE_BIG}"
+M_IMPL="${ARCHLOOP_MODEL_IMPL:-$LANE_BIG}"
+M_GATE="${ARCHLOOP_MODEL_GATE:-$LANE_BIG}"
 OC="${ARCHLOOP_OPENCODE:-}"
 if [ -z "$OC" ]; then
   # resolve opencode: $HOME path first, then the real user home (survives
@@ -125,6 +153,7 @@ fi
 SESSION_TIMEOUT="${ARCHLOOP_SESSION_TIMEOUT:-$DEFAULT_SESSION_TIMEOUT}"
 GATE_TIMEOUT="${ARCHLOOP_GATE_TIMEOUT:-$DEFAULT_GATE_TIMEOUT}"
 IDLE_TIMEOUT="${ARCHLOOP_IDLE_TIMEOUT:-$DEFAULT_IDLE_TIMEOUT}"
+RETRY_BACKOFF="${ARCHLOOP_RETRY_BACKOFF:-$DEFAULT_RETRY_BACKOFF}"
 WORKTREE_BASE="${ARCHLOOP_WORKTREE_BASE:-$DEFAULT_WORKTREE_BASE}"
 BASE_BRANCH="${ARCHLOOP_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}"
 MERGE_ENABLED="${ARCHLOOP_MERGE:-1}"
@@ -138,15 +167,33 @@ REPO_BASE="$(basename "$REPO")"
 WORKTREE="$WORKTREE_BASE/$REPO_BASE-night-$NIGHT"
 WORK="$REPO/.archloop/night-$NIGHT"
 LEDGER="$REPO/.archloop/ledger.md"
+STATUS_JSON="$REPO/.archloop/status.json"
 REPORT="$WORK/REPORT.md"
 log()    { printf '%s %s\n' "$(date +%T)" "$*" | tee -a "$WORK/driver.log"; }
 report() { printf '%s\n' "$*" >> "$REPORT"; }
+one_line() { # $1=text — flatten provider error output to one bounded log line
+  printf '%s' "$1" | tr '\t\n' '  ' | tr -s ' ' | cut -c1-300
+}
+
+# --- card E: refine the loop driver's status.json at stage transitions ------
+# loop.sh owns the file (pid/trigger/round/max_rounds); run.sh only rewrites
+# "stage"/"updated_at", atomically (tmp+rename), at the same points v1 parsing
+# reconstructs it from driver.log (session start/end, run complete). No-op when
+# the file is absent (run.sh launched directly) — v1 parsing stays the source.
+status_stage() { # $1=stage (scan-plan|i<N>-implement|i<N>-gate|idle|done)
+  [ -f "$STATUS_JSON" ] || return 0
+  local tmp="$STATUS_JSON.tmp.$$"
+  sed -e "s|\"stage\": \"[^\"]*\"|\"stage\": \"$1\"|" \
+      -e "s|\"updated_at\": [0-9]*|\"updated_at\": $(date +%s)|" \
+      "$STATUS_JSON" > "$tmp" && mv -f "$tmp" "$STATUS_JSON"
+}
 
 # One fresh session = one `opencode run` invocation. That IS the boundary.
-session() { # $1=model $2=logname $3=prompt [$4=timeout-override]
+session_run() { # $1=model $2=logname $3=prompt [$4=timeout] — one invocation
   local model="$1" name="$2" prompt="$3" tmo="${4:-$SESSION_TIMEOUT}"
   local out="$WORK/$name.log"
   log "session start: $name ($model)"
+  status_stage "$name"
   : > "$out"
   timeout "$tmo" "$OC" run --dir "$WORKTREE" --model "$model" \
     --title "archloop-$NIGHT-$name" "$prompt" > "$out" 2>&1 &
@@ -167,7 +214,35 @@ session() { # $1=model $2=logname $3=prompt [$4=timeout-override]
   wait "$pid"; local rc=$?
   kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
   log "session end: $name (exit $rc)"
+  status_stage idle
   return "$rc"
+}
+
+provider_failed() { # $1=exit-rc $2=session-log — provider-class failure?
+  [ "$1" -ne 0 ] || return 1
+  # The 2026-09-23 fleet night: two repos died 6s apart on the observed 429
+  # line; 401/402 surface as "[401]"/"[402]"/"Missing API key".
+  grep -qiE 'rate limit reached|\[401\]|\[402\]|missing api key' "$2" 2>/dev/null \
+    && return 0
+  # A session that exited non-zero having produced no output at all died at
+  # the provider too, not in the repo.
+  [ ! -s "$2" ]
+}
+
+session() { # $1=model $2=logname $3=prompt [$4=timeout-override]
+  local model="$1" name="$2" prompt="$3" tmo="${4:-$SESSION_TIMEOUT}" rc
+  session_run "$model" "$name" "$prompt" "$tmo" && return 0
+  rc=$?
+  # Provider-class failure only: every other failure class keeps today's
+  # semantics (abort on MISSING verdict, park on a red/blocked item).
+  provider_failed "$rc" "$WORK/$name.log" || return "$rc"
+  # The night should not die to a transient provider outage. Keep the failed
+  # attempt's log for the morning audit, back off, retry ONCE — a REAL re-run
+  # of the same prompt — on ARCHLOOP_MODEL_FALLBACK when one is set.
+  log "session $name: provider-class failure (exit $rc) — retrying in ${RETRY_BACKOFF}s on ${ARCHLOOP_MODEL_FALLBACK:-$model}"
+  mv "$WORK/$name.log" "$WORK/$name.log.provider-failed" 2>/dev/null || true
+  sleep "$RETRY_BACKOFF"
+  session_run "${ARCHLOOP_MODEL_FALLBACK:-$model}" "$name" "$prompt" "$tmo"
 }
 
 verdict() {
@@ -176,12 +251,23 @@ verdict() {
 }
 
 green() { # $1=label [$2=retries] — full suite + lint; logs; returns status
-  local label="$1" retries="${2:-1}" attempt=0
-  while [ "$attempt" -lt "$retries" ]; do
+  # 2026-08-17 rentcli postmortem: the loop below DOES re-execute the command
+  # every attempt — the observed ~1s-apart retries were pytest dying at
+  # collection in 0.86s each time because imports resolved to the CANONICAL
+  # checkout (editable install), and the overwritten log hid the evidence.
+  # Fix on both ends: PYTHONPATH below makes the worktree win over editable
+  # installs, and each failed attempt is kept as green-<label>-attempt<N>.log
+  # so attempts are individually auditable. The deciding run stays in
+  # green-<label>.log, same contract as before.
+  local label="$1" retries="${2:-1}" attempt=1
+  while [ "$attempt" -le "$retries" ]; do
     ( cd "$WORKTREE" && eval "$ARCHLOOP_TEST_CMD" && eval "$ARCHLOOP_LINT_CMD" ) \
       > "$WORK/green-$label.log" 2>&1 && return 0
+    log "green $label: attempt $attempt/$retries failed — re-executing"
+    if [ "$attempt" -lt "$retries" ]; then
+      mv "$WORK/green-$label.log" "$WORK/green-$label-attempt$attempt.log"
+    fi
     attempt=$((attempt + 1))
-    log "green $label retry $attempt/$retries"
   done
   log "green $label FAILED after $retries attempt(s)"
   return 1
@@ -200,6 +286,32 @@ prune_stale_worktrees() {
       done
 }
 
+# --- stage postlude: generated HTML never enters the record -------------------
+# The scan skill asks its reader to emit an HTML report; the nightly contract
+# is markdown + (future) JSON sidecars only. The scan prompt overrides the
+# skill, but a prompt is not enforcement — enforce at the session boundary:
+# night dir: any *.html a session dropped is deleted (keeps night dirs clean
+# for the JSON-sidecar contract); scan session: any worktree HTML it touched
+# is reverted (tracked) or deleted (untracked), so generated HTML can never
+# ride an implementer's commit into main. The skill itself stays untouched.
+drop_html() { # $1=stage name
+  local f
+  for f in "$WORK"/*.html; do
+    [ -e "$f" ] || continue
+    rm -f "$f" && log "dropped session HTML: $f"
+  done
+  [ "$1" = "scan-plan" ] || return 0
+  local dirty
+  dirty="$(git -C "$WORKTREE" status --porcelain -- '*.html' 2>/dev/null)"
+  [ -n "$dirty" ] || return 0
+  log "scan touched HTML in worktree — reverting: $(printf '%s ' $dirty)"
+  git -C "$WORKTREE" checkout -- '*.html' 2>/dev/null || true
+  git -C "$WORKTREE" ls-files --others --exclude-standard -- '*.html' \
+    | while IFS= read -r f; do
+        rm -f "$WORKTREE/$f" && log "dropped untracked worktree HTML: $f"
+      done
+}
+
 park() { # $1=item-name $2=stage $3=base-sha
   # ponytail: park MUST hit driver.log — without this an unattended run shows
   # "session end" then "run complete" with no trace of a discarded item, and
@@ -213,16 +325,56 @@ park() { # $1=item-name $2=stage $3=base-sha
   fi
 }
 
+PREFLIGHT_ERR=""
+preflight() {
+  # Provider preflight ping — one cheap call to the resolved scan model BEFORE
+  # the first scan session. 2026-09-23: two fleet repos died 6s apart on the
+  # same provider 429 — each burned a full scan session before the driver saw
+  # verdict MISSING and aborted. On failure: back off RETRY_BACKOFF, retry
+  # once, then abort with the reason while it is still early enough to spend
+  # the night elsewhere. Success costs ~one small call per night.
+  local attempt rc
+  for attempt in 1 2; do
+    log "provider preflight ping ($M_SCAN)"
+    PREFLIGHT_ERR="$(timeout 300 "$OC" run --dir "$WORKTREE" --model "$M_SCAN" \
+      --title "archloop-$NIGHT-preflight" \
+      "Provider preflight ping for the archloop night dir $WORK. Do not read, write or change anything. Reply with the single word OK and nothing else." 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    log "provider preflight ping failed (exit $rc): $(one_line "${PREFLIGHT_ERR:-no output}")"
+    [ "$attempt" -lt 2 ] || return 1
+    log "provider preflight: retrying in ${RETRY_BACKOFF}s"
+    sleep "$RETRY_BACKOFF"
+  done
+}
+
 # --- preflight ---------------------------------------------------------------
 cd "$REPO" || { echo "ABORT: cannot cd to $REPO"; exit 1; }
+# keep canonical tree clean without a .gitignore commit (a gitignore commit would
+# only land on main if the branch merges; info/exclude is repo-local and instant).
+# Hoisted ABOVE the horizon-doctor block below (t_5c3ecd27) so the doctor log can
+# land in .archloop/ on a first-ever run without tripping the dirty-tree check.
+grep -qx '.archloop/' "$REPO/.git/info/exclude" 2>/dev/null \
+  || printf '.archloop/\n' >> "$REPO/.git/info/exclude"
+# horizon doctor drift check (t_5c3ecd27): REPORT-only, never auto-fix. A drifted
+# store .gitignore keeps the checkout silently dirty across nights; surface it
+# here with its one-line fix hint. Read-only without --fix; the run is NOT
+# aborted by a FAIL alone — the dirty-tree check below still catches real dirt.
+mkdir -p "$REPO/.archloop"
+if command -v horizon >/dev/null 2>&1; then
+  horizon doctor > "$REPO/.archloop/doctor-preflight.log" 2>&1
+  drc=$?
+  if [ "$drc" -ne 0 ]; then
+    echo "PREFLIGHT: horizon doctor FAILED (exit $drc) — see .archloop/doctor-preflight.log; fix hint: horizon doctor --fix"
+  else
+    echo "PREFLIGHT: horizon doctor PASS (store .gitignore drift check clean)"
+  fi
+else
+  echo "PREFLIGHT: horizon doctor SKIPPED (horizon not on PATH)"
+fi
 [ -z "$(git status --porcelain)" ] || { echo "ABORT: dirty tree"; exit 1; }
 [ "$(git branch --show-current)" = "$BASE_BRANCH" ] || { echo "ABORT: must run on $BASE_BRANCH (on $(git branch --show-current))"; exit 1; }
 [ ! -f "$REPORT" ] || { echo "ABORT: $REPORT already exists — move or remove it before re-running"; exit 1; }
 mkdir -p "$WORK"; touch "$LEDGER"
-# keep canonical tree clean without a .gitignore commit (a gitignore commit would
-# only land on main if the branch merges; info/exclude is repo-local and instant)
-grep -qx '.archloop/' "$REPO/.git/info/exclude" 2>/dev/null \
-  || printf '.archloop/\n' >> "$REPO/.git/info/exclude"
 prune_stale_worktrees
 # ponytail: time suffix so a second run on the same date cannot `worktree add -B`
 # over the first one's commits and orphan them (happened 2026-07-24).
@@ -231,9 +383,20 @@ git -C "$REPO" worktree add -B "$BRANCH" "$WORKTREE" HEAD >/dev/null 2>&1 \
   || { log "ABORT: cannot create worktree $WORKTREE ($BRANCH)"; exit 1; }
 cleanup() { git -C "$REPO" worktree remove --force "$WORKTREE" 2>/dev/null || true; }
 trap cleanup EXIT
+# Green-check worktree isolation (2026-08-17 rentcli): pytest ran with rootdir
+# = this worktree but imports resolved to the CANONICAL checkout via an
+# editable install pointing there, so implementer renames were invisible and
+# good items got PARKED. cwd already is the worktree (green subshell cd);
+# the shadowing happened at import time. Prepending the worktree to PYTHONPATH
+# makes worktree code win over any editable install, for the green checks AND
+# for the sessions that run $ARCHLOOP_TEST_CMD themselves (implement/gate).
+export PYTHONPATH="$WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
 green preflight || { log "ABORT: baseline red — fix tests/lint before an unattended run"; exit 1; }
 report "# archloop $NIGHT — $(basename "$REPO") (worktree $WORKTREE, branch $BRANCH)"
 report ""
+# provider preflight: a dead provider must end the night here, not after a
+# burned scan session (one-line reason lands in driver.log).
+preflight || { log "ABORT: provider preflight failed: $(one_line "${PREFLIGHT_ERR:-no output}")"; exit 1; }
 
 # --- Stage 1 — one scan, one plan covering every Strong item ------------------
 session "$M_SCAN" "scan-plan" "FIRST, THE OUTPUT CONTRACT — a later automated step parses your plan file with a regex and the run is ABORTED if it does not match. This contract overrides any output format specified by any skill you read, and overrides the format of any existing plan.md you may find under .archloop/ from previous runs. Those older files use a different, obsolete format — do NOT imitate them.
@@ -280,11 +443,14 @@ RULES for every item:
 
 Then write the single word PLANNED to $WORK/verdict."
 
+drop_html "scan-plan"   # skill wants an HTML report; the night dir does not
+
 V="$(verdict "$WORK/verdict")"
 if [ "$V" = "NONE" ]; then
   report "No Strong candidates — nothing to do."
   echo "- $NIGHT scan: NONE (no Strong candidates)" >> "$LEDGER"
   log "scan found nothing Strong — run complete"
+  status_stage done
   exit 0
 fi
 if [ "$V" != "PLANNED" ]; then
@@ -327,6 +493,8 @@ Then, BEFORE writing your verdict, self-check: list the section's numbered steps
     park "$ITEM" "implement" "$BASE"; continue
   fi
 
+  drop_html "i$N-implement"   # an implementer's commit sweep must not carry HTML
+
   session "$M_GATE" "i$N-gate" "You are the ONLY reviewer of this change, and you have fix authority. Review the diff DIRECTLY yourself — do NOT invoke skills (no code-review) and do NOT spawn sub-agents; those fan out into parallel model sessions that burn quota.
 
 Review 'git diff $BASE..HEAD' in this repo against the '## Item: $ITEM' section of $WORK/plan.md. Do not praise. Do not summarise the diff back to me.
@@ -354,6 +522,7 @@ Before you review, state in gate-$ITEM.md what specific finding WOULD make you P
 Finally write to $WORK/verdict the single word SHIP or PARK." "$GATE_TIMEOUT"
 
   if [ "$(verdict "$WORK/verdict")" = "SHIP" ] && green "i$N-gate" 3; then
+    drop_html "i$N-gate"   # gate fixes commit too; HTML never enters the record
     echo "- $NIGHT $ITEM: SHIPPED on $BRANCH ($(git -C "$WORKTREE" rev-parse --short HEAD))" >> "$LEDGER"
     report "- **$ITEM** — SHIPPED: $(git -C "$WORKTREE" rev-parse --short "$BASE")..$(git -C "$WORKTREE" rev-parse --short HEAD) — see $WORK/gate-$ITEM.md"
   else
@@ -384,3 +553,4 @@ report ""
 report "Scan (full candidate pool, incl. non-Strong): $WORK/scan.md"
 report "Ledger: $LEDGER"
 log "run complete — report: $REPORT"
+status_stage done

@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# archloop — trigger the architecture loop from any harness (spec: harness-trigger §1-4).
+#
+# Usage:
+#   archloop start  [repo] [--preset cheap|strong|max] [--scan M] [--impl M] [--gate M]
+#                          [--max-items N] [--max-rounds N]
+#   archloop presets [repo]     # list resolved presets
+#   archloop status  [repo] [--json]   # read-only state from existing artifacts
+#   archloop ui [--repo PATH]... [--out DIR] [--format html|text]
+#              [--no-summarize] [--summarize-only] [--force-summarize]
+#              [--model ID] [--screenshot [--out-image PATH]] [--no-open]
+#   # without --repo: $ARCHLOOP_REPOS_CONF if set, else auto-discovery of
+#   # archloop repos one level under $ARCHLOOP_REPO_ROOT (default ~/git)
+#   # — ~/.config/archloop/repos.conf is no longer auto-read (docs/ui.md)
+#
+# start refuses (exit 2, one-line reason) if the repo has no .archloop/config,
+# is dirty / off main, or a loop for it is already running. Otherwise it
+# validates the resolved model ids (roster + PONG probe for non-default ids)
+# and launches archloop-loop.sh detached.
+#
+# status (card C, §4) is read-only over <repo>/.archloop: driver.log (stage +
+# actual models), plan.md ^## Item: (queue), ledger.md dated SHIPPED/PARKED,
+# loop-driver.log (rounds), pgrep (alive), ~/.hermes/logs/archloop-night.log
+# (nightly trigger). REPORT.md prose is never parsed.
+set -uo pipefail
+
+# Real user home — opencode dies with a generic UnknownError under a sandboxed
+# HOME, and presets.conf lives in the real home's ~/.config (r3-model-validation).
+REAL_HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+OC="${ARCHLOOP_OPENCODE:-$REAL_HOME/.opencode/bin/opencode}"
+[ -x "$OC" ] || OC="$(command -v opencode 2>/dev/null || true)"
+# Resolve through symlinks (e.g. ~/.local/bin/archloop -> <repo>/bin/archloop):
+# a bare $0-based dirname points at the link's directory, where neither
+# archloop-loop.sh nor ../scripts/ui exists.
+BIN_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+. "$BIN_DIR/../scripts/lib/lanes.sh"
+# The loop driver is tracked at the repo root, one level up from bin/ (flag
+# 107): $BIN_DIR/archloop-loop.sh never existed and made `archloop start`
+# die with exit 2. ARCHLOOP_LOOP_SCRIPT still overrides.
+LOOP_SCRIPT="${ARCHLOOP_LOOP_SCRIPT:-$BIN_DIR/../archloop-loop.sh}"
+# presets.conf lives in the real home; ARCHLOOP_PRESETS_CONF overrides for tests.
+PRESETS_CONF="${ARCHLOOP_PRESETS_CONF:-$REAL_HOME/.config/archloop/presets.conf}"
+
+# Builtin presets (spec §2). Overridable/extendable via
+# $REAL_HOME/.config/archloop/presets.conf — one preset per line:
+#   name scan-model impl-model gate-model
+# Model ids come from scripts/lib/lanes.sh (single source, never duplicated).
+BUILTIN_PRESETS="cheap|$LANE_FLASH|$LANE_FLASH|$LANE_BIG
+strong|$LANE_BIG|$LANE_FLASH|$LANE_BIG
+max|$LANE_BIG|$LANE_BIG|$LANE_BIG"
+# Ids never PONG-probed (spec §3): the plan's two proven defaults.
+PONG_SKIP="$LANE_FLASH $LANE_BIG"
+
+die() { echo "archloop: $*" >&2; exit "${2:-2}"; }
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+# load_presets -> "$PRESETS" (newline-separated name|scan|impl|gate)
+load_presets() {
+  local conf="$PRESETS_CONF" line
+  PRESETS="$BUILTIN_PRESETS"
+  [ -f "$conf" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | tr -s ' \t' ' ' | sed 's/^ //;s/ $//')"
+    [ -n "$line" ] || continue
+    case "$(echo "$line" | awk -F'|' '{print NF}')" in
+      4) : ;;
+      *) die "presets.conf: malformed line (want 'name scan impl gate'): $line" 1 ;;
+    esac
+    local name="$(echo "$line" | cut -d'|' -f1)"
+    # later lines win: file overrides builtins, later overrides earlier
+    PRESETS="$(grep -v "^$name|" <<<"$PRESETS"; echo "$line")"
+  done < "$conf"
+}
+
+preset_field() { # $1=preset-name $2=field(2=scan 3=impl 4=gate)
+  awk -F'|' -v n="$1" -v f="$2" '$1==n{print $f}' <<<"$PRESETS" | head -1
+}
+
+# resolve_models <preset-or-empty> [scan] [impl] [gate]
+# Sets M_SCAN/M_IMPL/M_GATE. Per-stage flag > --preset > repo ARCHLOOP_PRESET > cheap.
+resolve_models() {
+  local repo="$1" preset="${2:-}" 
+  if [ -z "$preset" ] && [ -f "$repo/.archloop/config" ]; then
+    preset="$(bash -c '. "$1" >/dev/null 2>&1; printf %s "${ARCHLOOP_PRESET:-}"' _ "$repo/.archloop/config")"
+  fi
+  preset="${preset:-cheap}"
+  M_SCAN="$(preset_field "$preset" 2)"
+  M_IMPL="$(preset_field "$preset" 3)"
+  M_GATE="$(preset_field "$preset" 4)"
+  [ -n "$M_SCAN" ] || die "unknown preset: $preset"
+  [ -n "${3:-}" ] && M_SCAN="$3"
+  [ -n "${4:-}" ] && M_IMPL="$4"
+  [ -n "${5:-}" ] && M_GATE="$5"
+}
+
+# validate_models — roster membership for all three ids, PONG only for ids
+# outside $PONG_SKIP. Dies (exit 2) naming the first bad id.
+validate_models() {
+  local id out
+  [ -x "$OC" ] || die "opencode binary not found — set ARCHLOOP_OPENCODE"
+  export HOME="$REAL_HOME"
+  for id in "$M_SCAN" "$M_IMPL" "$M_GATE"; do
+    if ! timeout 30 "$OC" models 2>/dev/null | grep -Fxq "$id"; then
+      die "model id not in opencode roster: $id"
+    fi
+  done
+  for id in "$M_SCAN" "$M_IMPL" "$M_GATE"; do
+    grep -qw "$id" <<<"$PONG_SKIP" && continue
+    out="$(cd /tmp && timeout 60 "$OC" run --model "$id" 'Reply with exactly: PONG' 2>/dev/null)"
+    grep -q "PONG" <<<"$out" || die "model did not answer PONG: $id"
+  done
+}
+
+is_running() { # $1=repo — a loop or runner for this repo already alive?
+  pgrep -f "archloop-loop.sh $1" >/dev/null 2>&1 \
+    || pgrep -f "andre-archloop/run.sh $1" >/dev/null 2>&1
+}
+
+cmd_start() {
+  local repo="" preset="" os="" oi="" og="" items="" rounds="" a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --preset)    preset="$2"; shift 2 ;;
+      --scan)      os="$2"; shift 2 ;;
+      --impl)      oi="$2"; shift 2 ;;
+      --gate)      og="$2"; shift 2 ;;
+      --max-items) items="$2"; shift 2 ;;
+      --max-rounds) rounds="$2"; shift 2 ;;
+      --*) die "unknown option: $1 (see: archloop start --help)" 1 ;;
+      *) [ -z "$repo" ] || die "unexpected argument: $1" 1; repo="$1"; shift ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || die "no repo given and cwd is not a git repository"
+  repo="$(realpath "$repo")"
+  [ -f "$repo/.archloop/config" ] || die "no .archloop/config in $repo — create it first (see run.sh defaults)"
+  # Same repo-local exclude the loop driver installs before run.sh's dirty
+  # preflight: without it the required .archloop/config reads as a dirty tree.
+  grep -qx '.archloop/' "$repo/.git/info/exclude" 2>/dev/null \
+    || printf '.archloop/\n' >> "$repo/.git/info/exclude"
+  [ -z "$(git -C "$repo" status --porcelain)" ] || die "canonical checkout is dirty — commit or stash first"
+  [ "$(git -C "$repo" branch --show-current)" = "main" ] \
+    || die "canonical checkout must be on main (on $(git -C "$repo" branch --show-current))"
+  is_running "$repo" && die "a loop is already running for $repo"
+  [ -f "$LOOP_SCRIPT" ] || die "archloop-loop.sh not found at $LOOP_SCRIPT"
+
+  load_presets
+  resolve_models "$repo" "$preset" "$os" "$oi" "$og"
+  validate_models
+
+  # Pass both positional caps explicitly: archloop-loop.sh takes them
+  # positionally, so --max-rounds alone would land in the max_items slot.
+  # Defaults mirror the loop driver's own env knobs, so they never drift.
+  items="${items:-${ARCHLOOP_MAX_ITEMS:-5}}"
+  rounds="${rounds:-${ARCHLOOP_MAX_LOOPS:-8}}"
+  local pid
+  pid="$(setsid nohup env HOME="$REAL_HOME" ARCHLOOP_IDLE_TIMEOUT=1800 \
+    ARCHLOOP_TRIGGER=manual \
+    ARCHLOOP_MODEL_SCAN="$M_SCAN" ARCHLOOP_MODEL_IMPL="$M_IMPL" ARCHLOOP_MODEL_GATE="$M_GATE" \
+    bash "$LOOP_SCRIPT" "$repo" "$items" "$rounds" >/dev/null 2>&1 & echo $!)"
+  echo "archloop started: pid=$pid"
+  echo "  repo:  $repo"
+  echo "  models: scan=$M_SCAN impl=$M_IMPL gate=$M_GATE"
+  echo "  caps:  max_items=$items max_rounds=$rounds"
+  echo "  log:   $repo/.archloop/loop-driver.log"
+}
+
+cmd_presets() {
+  local repo="${1:-}" line name
+  [ -z "$repo" ] || repo="$(realpath "$repo")"
+  load_presets
+  printf '%-10s %-22s %-22s %s\n' PRESET SCAN IMPL GATE
+  while IFS= read -r line; do
+    IFS='|' read -r name os oi og <<<"$line"
+    printf '%-10s %-22s %-22s %s\n' "$name" "$os" "$oi" "$og"
+  done <<<"$PRESETS"
+  if [ -n "$repo" ] && [ -f "$repo/.archloop/config" ]; then
+    resolve_models "$repo"
+    echo "default for this repo: $M_SCAN / $M_IMPL / $M_GATE"
+  fi
+}
+
+# ======================= status (spec §4, card C) ==========================
+# Read-only. Never writes into <repo>, never parses REPORT.md prose.
+# Fields are extracted by read_status (plain grep/sed/awk) and serialized by
+# a single python3 emitter; python owns all quoting and escaping.
+
+NIGHT_LOG="${ARCHLOOP_NIGHT_LOG:-$REAL_HOME/.hermes/logs/archloop-night.log}"
+TODAY="$(date +%F)"
+
+# Fields set by read_status():
+#   S_REPO S_ALIVE S_PID S_TRIGGER S_STAGE S_CUR S_MODELS_S/I/G S_LL S_NDIR
+#   S_SHIPPED[] S_PARKED[] S_QUEUE_N[] S_QUEUE_SUM[]  (+ S_ROUND/S_MAXR)
+
+# scan_section_summary <plan.md> <name> — first non-heading, non-blank line of
+# the item's section body (header line up to the next ## heading).
+scan_section_summary() {
+  awk -v item="## Item: $2" '
+    $0 == item { in_sec = 1; next }
+    in_sec && /^## / { exit }
+    in_sec && NF && $0 !~ /^#/ { sub(/^[ \t]+/, ""); print; exit }
+  ' "$1"
+}
+
+read_status() { # $1=repo
+  local repo="$1" ar="$1/.archloop" dir="$1/.archloop/night-$(date +%F)" line
+  local sj vals sj_pid sj_trig sj_round sj_maxr sj_stage sj_stage_set=""
+  S_REPO="$repo"; S_ALIVE=false; S_PID=""; S_TRIGGER=""; S_STAGE="idle"
+  S_CUR=""; S_MODELS_S=""; S_MODELS_I=""; S_MODELS_G=""; S_LL=""
+  S_NDIR=""; S_ROUND=""; S_MAXR=""
+  S_SHIPPED=(); S_PARKED=(); S_QUEUE_N=(); S_QUEUE_SUM=()
+
+  # status.json (card E, preferred source): the loop driver's own record.
+  # A live loop pid wins outright (the writers refresh the file at every
+  # transition, so it is never staler than the artifacts v1 parses). A dead
+  # pid means the run finished or crashed: trigger/round/max_rounds still
+  # speak for tonight's run — but only if the file was written today;
+  # alive/stage always fall back to v1 parsing below.
+  sj="$ar/status.json"
+  if [ -s "$sj" ]; then
+    vals="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+def s(k):
+    v = d.get(k)
+    return "" if v is None else str(v)
+print(s("pid")); print(s("trigger")); print(s("round"))
+print(s("max_rounds")); print(s("stage"))' "$sj" 2>/dev/null)" || vals=""
+    if [ -n "$vals" ]; then
+      # mapfile, not read: read would stop at the first newline and leave
+      # fields 2-5 empty (caught by status-tests test 7/8).
+      local -a sj_parts=()
+      mapfile -t sj_parts <<<"$vals"
+      sj_pid="${sj_parts[0]}"; sj_trig="${sj_parts[1]}"; sj_round="${sj_parts[2]}"
+      sj_maxr="${sj_parts[3]}"; sj_stage="${sj_parts[4]}"
+      if [ -n "$sj_pid" ] && [ "$sj_pid" -gt 0 ] 2>/dev/null \
+         && ps -p "$sj_pid" -o args= 2>/dev/null | grep -qF "archloop-loop.sh"; then
+        S_ALIVE=true; S_PID="$sj_pid"; sj_stage_set=1
+        [ -n "$sj_trig" ]  && S_TRIGGER="$sj_trig"
+        [ -n "$sj_round" ] && S_ROUND="$sj_round"
+        [ -n "$sj_maxr" ]  && S_MAXR="$sj_maxr"
+        [ -n "$sj_stage" ] && S_STAGE="$sj_stage"
+      elif [ "$(date -r "$sj" '+%F')" = "$TODAY" ]; then
+        [ -n "$sj_trig" ]  && S_TRIGGER="$sj_trig"
+        [ -n "$sj_round" ] && S_ROUND="$sj_round"
+        [ -n "$sj_maxr" ]  && S_MAXR="$sj_maxr"
+      fi
+    fi
+  fi
+
+  # alive (v1 fallback): same repo-scoped pgrep the launcher itself uses
+  # (spec §1) — still needed for a live run.sh orphan under a dead loop pid.
+  if [ "$S_ALIVE" != true ]; then
+    if pgrep -f "archloop-loop.sh $repo" >/dev/null 2>&1 \
+       || pgrep -f "andre-archloop/run.sh $repo" >/dev/null 2>&1; then
+      S_ALIVE=true
+      S_PID="$(pgrep -f "archloop-loop.sh $repo" | head -1)"
+      [ -n "$S_PID" ] || S_PID="$(pgrep -f "andre-archloop/run.sh $repo" | head -1)"
+    fi
+  fi
+
+  # trigger (v1 fallback): nightly = START line for this repo basename today
+  if [ -z "$S_TRIGGER" ] && [ -f "$NIGHT_LOG" ]; then
+    if grep -F "$TODAY" "$NIGHT_LOG" 2>/dev/null \
+       | grep -F "START $(basename "$repo"): launching loop driver" >/dev/null; then
+      S_TRIGGER="nightly"
+    fi
+  fi
+
+  # live round = unsuffixed night-<today>; else newest audit dir; else no dir
+  if [ ! -d "$dir" ]; then
+    dir="$(ls -1d "$ar"/night-"$TODAY"-* 2>/dev/null | sort -V | tail -1)"
+  fi
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    S_NDIR="$dir"
+  else
+    return 0
+  fi
+
+  # ledger: SHIPPED/PARKED lines dated today
+  if [ -f "$ar/ledger.md" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "- $TODAY "*": SHIPPED "*) S_SHIPPED+=("${line#- $TODAY }"); S_SHIPPED[-1]="${S_SHIPPED[-1]%%:*}" ;;
+        "- $TODAY "*": PARKED "*)  S_PARKED+=("${line#- $TODAY }");  S_PARKED[-1]="${S_PARKED[-1]%%:*}" ;;
+      esac
+    done < <(grep -E "^- $TODAY .+: (SHIPPED|PARKED) " "$ar/ledger.md")
+  fi
+
+  # loop-driver.log (v1 fallback): last "=== round i/N ===" banner
+  if [ -z "$S_ROUND" ] && [ -f "$ar/loop-driver.log" ]; then
+    line="$(grep -E '^..:..:.. === round [0-9]+/[0-9]+: starting run.sh ===$' "$ar/loop-driver.log" | tail -1)"
+    S_ROUND="${line##*=== round }"; S_ROUND="${S_ROUND%%/*}"
+    S_MAXR="${line#*/}"; S_MAXR="${S_MAXR%%:*}"
+  fi
+
+  # driver.log (live round): stage (v1 fallback) + actual models + last log line
+  if [ -f "$dir/driver.log" ]; then
+    S_LL="$(tail -1 "$dir/driver.log" 2>/dev/null)"
+    # stage: last session start/end wins; trailing merging/run-complete = done.
+    # Skipped when status.json's live loop pid already set the stage (card E).
+    if [ -z "$sj_stage_set" ]; then
+      case "$S_LL" in
+        *"run complete"*|*"merging "*) S_STAGE="done" ;;
+        *)
+          line="$(grep -E '^..:..:.. session (start|end): ' "$dir/driver.log" | tail -1)"
+          local name
+          name="$(sed -n 's/^.*session \(start\|end\): \([^ ]*\) (.*$/\2/p' <<<"$line")"
+          case "$line" in
+            *"session start: "*) S_STAGE="$name" ;;
+            *) S_STAGE="idle" ;;
+          esac
+          ;;
+      esac
+    fi
+    # models: first scan-plan / iN-implement / iN-gate session-start model
+    S_MODELS_S="$(sed -n 's/^.*session start: scan-plan (\([^)]*\)).*$/\1/p' "$dir/driver.log" | head -1)"
+    S_MODELS_I="$(sed -n 's/^.*session start: i[0-9]*-implement (\([^)]*\)).*$/\1/p' "$dir/driver.log" | head -1)"
+    S_MODELS_G="$(sed -n 's/^.*session start: i[0-9]*-gate (\([^)]*\)).*$/\1/p' "$dir/driver.log" | head -1)"
+    S_CUR=""
+    case "$S_STAGE" in
+      i*-implement|i*-gate)
+        # item index -> Nth ^## Item: header in this round's plan.md
+        # (strip the leading i and the -stage suffix: i3-implement -> 3)
+        local n="${S_STAGE%%-*}"; n="${n#i}"
+        if [ -f "$dir/plan.md" ]; then
+          S_CUR="$(sed -n 's/^## Item: *//p' "$dir/plan.md" | sed -n "${n}p")"
+        fi
+        ;;
+    esac
+  fi
+
+  # queue: this round's plan items minus today's ledger outcomes
+  if [ -f "$dir/plan.md" ]; then
+    local -a plan_items=()
+    while IFS= read -r line; do
+      plan_items+=("$line")
+    done < <(sed -n 's/^## Item: *//p' "$dir/plan.md")
+    local done_name q
+    for q in "${plan_items[@]}"; do
+      done_name=""
+      for line in "${S_SHIPPED[@]:-}" "${S_PARKED[@]:-}"; do
+        [ "$line" = "$q" ] && { done_name=1; break; }
+      done
+      [ -n "$done_name" ] && continue
+      # queue only items not yet started: after the current item, or all when idle
+      if [ -n "$S_CUR" ] && [ "$q" = "$S_CUR" ]; then
+        continue   # current item is being worked on, not queued
+      fi
+      # when idle mid-item, everything unstarted counts as queued
+      S_QUEUE_N+=("$q")
+      S_QUEUE_SUM+=("$(scan_section_summary "$dir/plan.md" "$q")")
+    done
+  fi
+}
+
+emit_status_json() {
+  python3 -c '
+import sys, json
+def lines():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        yield line.rstrip("\n")
+L = lines()
+repo = next(L); alive = next(L); pid = next(L); trigger = next(L)
+round_ = next(L); maxr = next(L); stage = next(L); cur = next(L)
+queue_n = [x for x in next(L).split("\t") if x]; queue_s = next(L).split("\t")
+shipped = next(L).split("\t"); parked = next(L).split("\t")
+ms = next(L); mi = next(L); mg = next(L); ll = next(L); ndir = next(L)
+def s(v): return v if v else None
+out = {
+    "repo": repo,
+    "alive": alive == "true",
+    "pid": int(pid) if pid else None,
+    "trigger": s(trigger),
+    "round": int(round_) if round_ else None,
+    "max_rounds": int(maxr) if maxr else None,
+    "stage": stage,
+    "current_item": s(cur),
+    "queued_items": [
+        {"name": n, "summary": (queue_s[i] or None)}
+        for i, n in enumerate(queue_n)
+    ],
+    "shipped_today": [x for x in shipped if x],
+    "parked_today": [x for x in parked if x],
+    "models": {"scan": s(ms), "impl": s(mi), "gate": s(mg)},
+    "last_log_line": s(ll),
+    "night_dir": s(ndir),
+}
+sys.stdout.write(json.dumps(out, indent=None) + "\n")
+' <<EOF
+$S_REPO
+$S_ALIVE
+$S_PID
+$S_TRIGGER
+$S_ROUND
+$S_MAXR
+$S_STAGE
+$S_CUR
+$(printf '%s\t' "${S_QUEUE_N[@]:-}"; echo)
+$(printf '%s\t' "${S_QUEUE_SUM[@]:-}"; echo)
+$(printf '%s\t' "${S_SHIPPED[@]:-}"; echo)
+$(printf '%s\t' "${S_PARKED[@]:-}"; echo)
+$S_MODELS_S
+$S_MODELS_I
+$S_MODELS_G
+$S_LL
+$S_NDIR
+EOF
+}
+
+emit_status_text() {
+  local i
+  echo "repo: $S_REPO"
+  [ "$S_ALIVE" = true ] && echo "alive: yes" || echo "alive: no"
+  if [ -n "$S_PID" ]; then echo "pid: $S_PID"; else echo "pid: -"; fi
+  if [ -n "$S_TRIGGER" ]; then echo "trigger: $S_TRIGGER"; else echo "trigger: unknown"; fi
+  if [ -n "$S_ROUND" ]; then echo "round: $S_ROUND/$S_MAXR"; else echo "round: -"; fi
+  echo "stage: $S_STAGE"
+  if [ -n "$S_CUR" ]; then echo "current item: $S_CUR"; else echo "current item: -"; fi
+  echo "queued items (${#S_QUEUE_N[@]}):"
+  if [ "${#S_QUEUE_N[@]}" -gt 0 ]; then
+    for i in "${!S_QUEUE_N[@]}"; do
+      echo "  - ${S_QUEUE_N[i]}"
+      [ -n "${S_QUEUE_SUM[i]}" ] && echo "      ${S_QUEUE_SUM[i]}"
+    done
+  else
+    echo "  (none)"
+  fi
+  echo "shipped today (${#S_SHIPPED[@]}):"
+  for i in "${!S_SHIPPED[@]}"; do echo "  - ${S_SHIPPED[i]}"; done
+  echo "parked today (${#S_PARKED[@]}):"
+  for i in "${!S_PARKED[@]}"; do echo "  - ${S_PARKED[i]}"; done
+  echo "models: scan $S_MODELS_S impl $S_MODELS_I gate $S_MODELS_G"
+  echo "night dir: ${S_NDIR:--}"
+  echo "last log: ${S_LL:--}"
+  if [ -z "$S_NDIR" ]; then echo "no archloop state found for this repo"; fi
+}
+
+cmd_status() {
+  local repo="" json=0 a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --*) die "unknown option: $1 (see: archloop status --help)" 1 ;;
+      *) [ -z "$repo" ] || die "unexpected argument: $1" 1; repo="$1"; shift ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || die "no repo given and cwd is not a git repository"
+  repo="$(realpath "$repo")"
+  read_status "$repo"
+  if [ "$json" -eq 1 ]; then emit_status_json; else emit_status_text; fi
+}
+
+cmd_ui() {
+  local repos_cli="" out="" fmt=html summarize=1 summarize_only=0 force=0 model="" shot=0 shot_out="" open=1 default_out=0 a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)           repos_cli="${repos_cli:+$repos_cli$'\n'}$2"; shift 2 ;;
+      --out)            out="$2"; shift 2 ;;
+      --format)         fmt="$2"; shift 2 ;;
+      --no-summarize)   summarize=0; shift ;;
+      --summarize-only) summarize=1; summarize_only=1; shift ;;
+      --force-summarize) summarize=1; force=1; shift ;;
+      --model)          model="$2"; shift 2 ;;
+      --screenshot)     shot=1; shift ;;
+      --out-image)      shot_out="$2"; shift 2 ;;
+      --no-open)        open=0; shift ;;
+      --help)           usage ;;
+      --*) die "unknown option: $1 (see: archloop ui --help)" 1 ;;
+      *) die "unexpected argument: $1" 1 ;;
+    esac
+  done
+  case "$fmt" in html|text) ;; *) die "--format must be html or text" ;; esac
+  UI_LIB_DIR="$(cd "$BIN_DIR/../scripts/ui" && pwd)"
+  . "$UI_LIB_DIR/common.sh"
+  . "$UI_LIB_DIR/parse.sh"
+  . "$UI_LIB_DIR/summarize.sh"
+  . "$UI_LIB_DIR/render.sh"
+  . "$UI_LIB_DIR/screenshot.sh"
+  ui_discover_repos "$repos_cli"
+  # No --out: the ephemeral view flow — render into the stable tmp dir and
+  # open it below. --out DIR keeps the scriptable render-in-place behavior.
+  [ "$summarize_only" -eq 1 ] || [ -n "$out" ] || { out="$UI_OUT_DEFAULT"; default_out=1; }
+  # 1. parse
+  local recs rc=0
+  recs="$(mktemp)"
+  trap 'rm -f "$recs"' RETURN
+  local r
+  for r in $UI_REPOS; do ui_parse_repo "$r"; done > "$recs"
+  # 2. summarize (post-pass, spec §4) — skipped with --no-summarize
+  if [ "$summarize" -eq 1 ]; then
+    local line idx=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      local f; IFS="$UI_US" read -r -a f <<<"$line"
+      # only nights with items and a plan/gate context are worth a session
+      [ -n "${f[10]:-}" ] || continue
+      ui_resolve_model "${f[0]}" "$model"
+      ui_summarize "${f[0]}" "${f[0]}/.archloop/night-${f[1]}${f[2]}" "${f[10]}" "$force"
+    done < "$recs"
+  fi
+  [ "$UI_SUMMARY_FAILED" -eq 0 ] || rc=1
+  # 3. render
+  if [ "$summarize_only" -eq 0 ]; then
+    if [ "$fmt" = text ]; then
+      ui_render_text "$recs"
+    else
+      # the tmp view is rebuilt from scratch: pages from an older corpus
+      # must not linger next to a fresh render
+      [ "$default_out" -eq 1 ] && rm -rf "$out"
+      ui_render_html "$recs" "$out"
+      echo "archloop ui: site rendered to $out/index.html" >&2
+    fi
+  fi
+  # 4. screenshot
+  if [ "$shot" -eq 1 ]; then
+    [ "$fmt" = html ] || die "--screenshot requires --format html"
+    [ -n "$shot_out" ] || shot_out="ui-index.png"
+    ui_capture "$(cd "$out" && pwd)/index.html" "$(realpath -m "$shot_out")" || rc=1
+    echo "archloop ui: screenshot written to $(realpath -m "$shot_out")" >&2
+  fi
+  # 5. open — bare view flow only (--out / --format text / --summarize-only
+  # runs stay script-friendly and never touch a browser)
+  if [ "$open" -eq 1 ] && [ "$default_out" -eq 1 ] && [ "$fmt" = html ]; then
+    ui_open "$out/index.html"
+  fi
+  return "$rc"
+}
+
+case "${1:-}" in
+  start)   shift; cmd_start "$@" ;;
+  presets) shift; [ "${1:-}" = "--help" ] && usage; cmd_presets "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  ui)      shift; [ "${1:-}" = "--help" ] && usage; cmd_ui "$@" ;;
+  --help|-h|help) usage ;;
+  *) usage ;;
+esac
